@@ -12,6 +12,7 @@ import (
 	"sync"
 
 	"github.com/ThomsonReutersEikon/go-ntlm/ntlm"
+	"github.com/git-lfs/git-lfs/config"
 	"github.com/git-lfs/git-lfs/errors"
 )
 
@@ -23,6 +24,7 @@ var (
 type Client struct {
 	Endpoints   EndpointFinder
 	Credentials CredentialHelper
+	SSH         SSHResolver
 	Netrc       NetrcFinder
 
 	DialTimeout         int
@@ -36,7 +38,6 @@ type Client struct {
 
 	Verbose          bool
 	DebuggingVerbose bool
-	LoggingStats     bool
 	VerboseOut       io.Writer
 
 	hostClients map[string]*http.Client
@@ -45,14 +46,14 @@ type Client struct {
 	ntlmSessions map[string]ntlm.ClientSession
 	ntlmMu       sync.Mutex
 
-	transferBuckets  map[string][]*http.Response
-	transferBucketMu sync.Mutex
-	transfers        map[*http.Response]*httpTransfer
-	transferMu       sync.Mutex
+	httpLogger *syncLogger
+
+	LoggingStats bool // DEPRECATED
 
 	// only used for per-host ssl certs
 	gitEnv Env
 	osEnv  Env
+	uc     *config.URLConfig
 }
 
 func NewClient(osEnv Env, gitEnv Env) (*Client, error) {
@@ -71,25 +72,34 @@ func NewClient(osEnv Env, gitEnv Env) (*Client, error) {
 
 	httpsProxy, httpProxy, noProxy := getProxyServers(osEnv, gitEnv)
 
+	var creds CredentialHelper = &commandCredentialHelper{
+		SkipPrompt: !osEnv.Bool("GIT_TERMINAL_PROMPT", true),
+	}
+	var sshResolver SSHResolver = &sshAuthClient{os: osEnv}
+
+	if gitEnv.Bool("lfs.cachecredentials", false) {
+		creds = withCredentialCache(creds)
+		sshResolver = withSSHCache(sshResolver)
+	}
+
 	c := &Client{
-		Endpoints: NewEndpointFinder(gitEnv),
-		Credentials: &commandCredentialHelper{
-			SkipPrompt: !osEnv.Bool("GIT_TERMINAL_PROMPT", true),
-		},
+		Endpoints:           NewEndpointFinder(gitEnv),
+		Credentials:         creds,
+		SSH:                 sshResolver,
 		Netrc:               netrc,
 		DialTimeout:         gitEnv.Int("lfs.dialtimeout", 0),
 		KeepaliveTimeout:    gitEnv.Int("lfs.keepalive", 0),
 		TLSTimeout:          gitEnv.Int("lfs.tlstimeout", 0),
-		ConcurrentTransfers: gitEnv.Int("lfs.concurrenttransfers", 0),
+		ConcurrentTransfers: gitEnv.Int("lfs.concurrenttransfers", 3),
 		SkipSSLVerify:       !gitEnv.Bool("http.sslverify", true) || osEnv.Bool("GIT_SSL_NO_VERIFY", false),
 		Verbose:             osEnv.Bool("GIT_CURL_VERBOSE", false),
 		DebuggingVerbose:    osEnv.Bool("LFS_DEBUG_HTTP", false),
-		LoggingStats:        osEnv.Bool("GIT_LOG_STATS", false),
 		HTTPSProxy:          httpsProxy,
 		HTTPProxy:           httpProxy,
 		NoProxy:             noProxy,
 		gitEnv:              gitEnv,
 		osEnv:               osEnv,
+		uc:                  config.NewURLConfig(gitEnv),
 	}
 
 	return c, nil
@@ -148,18 +158,79 @@ func sanitizedURL(u *url.URL) string {
 // relies on.
 type Env interface {
 	Get(string) (string, bool)
+	GetAll(string) []string
 	Int(string, int) int
 	Bool(string, bool) bool
-	All() map[string]string
+	All() map[string][]string
+}
+
+type UniqTestEnv map[string]string
+
+func (e UniqTestEnv) Get(key string) (v string, ok bool) {
+	v, ok = e[key]
+	return
+}
+
+func (e UniqTestEnv) GetAll(key string) []string {
+	if v, ok := e.Get(key); ok {
+		return []string{v}
+	}
+	return make([]string, 0)
+}
+
+func (e UniqTestEnv) Int(key string, def int) (val int) {
+	s, _ := e.Get(key)
+	if len(s) == 0 {
+		return def
+	}
+
+	i, err := strconv.Atoi(s)
+	if err != nil {
+		return def
+	}
+
+	return i
+}
+
+func (e UniqTestEnv) Bool(key string, def bool) (val bool) {
+	s, _ := e.Get(key)
+	if len(s) == 0 {
+		return def
+	}
+
+	switch strings.ToLower(s) {
+	case "true", "1", "on", "yes", "t":
+		return true
+	case "false", "0", "off", "no", "f":
+		return false
+	default:
+		return false
+	}
+}
+
+func (e UniqTestEnv) All() map[string][]string {
+	m := make(map[string][]string)
+	for k, _ := range e {
+		m[k] = e.GetAll(k)
+	}
+	return m
 }
 
 // TestEnv is a basic config.Environment implementation. Only used in tests, or
 // as a zero value to NewClient().
-type TestEnv map[string]string
+type TestEnv map[string][]string
 
 func (e TestEnv) Get(key string) (string, bool) {
-	v, ok := e[key]
-	return v, ok
+	all := e.GetAll(key)
+
+	if len(all) == 0 {
+		return "", false
+	}
+	return all[len(all)-1], true
+}
+
+func (e TestEnv) GetAll(key string) []string {
+	return e[key]
 }
 
 func (e TestEnv) Int(key string, def int) (val int) {
@@ -192,6 +263,6 @@ func (e TestEnv) Bool(key string, def bool) (val bool) {
 	}
 }
 
-func (e TestEnv) All() map[string]string {
+func (e TestEnv) All() map[string][]string {
 	return e
 }

@@ -1,15 +1,218 @@
 package lfsapi
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
+func TestSSHCacheResolveFromCache(t *testing.T) {
+	ssh := newFakeResolver()
+	cache := withSSHCache(ssh).(*sshCache)
+	cache.endpoints["userandhost//1//path//post"] = &sshAuthResponse{
+		Href:      "cache",
+		createdAt: time.Now(),
+	}
+	ssh.responses["userandhost"] = sshAuthResponse{Href: "real"}
+
+	e := Endpoint{
+		SshUserAndHost: "userandhost",
+		SshPort:        "1",
+		SshPath:        "path",
+	}
+
+	res, err := cache.Resolve(e, "post")
+	assert.Nil(t, err)
+	assert.Equal(t, "cache", res.Href)
+}
+
+func TestSSHCacheResolveFromCacheWithFutureExpiresAt(t *testing.T) {
+	ssh := newFakeResolver()
+	cache := withSSHCache(ssh).(*sshCache)
+	cache.endpoints["userandhost//1//path//post"] = &sshAuthResponse{
+		Href:      "cache",
+		ExpiresAt: time.Now().Add(time.Duration(1) * time.Hour),
+		createdAt: time.Now(),
+	}
+	ssh.responses["userandhost"] = sshAuthResponse{Href: "real"}
+
+	e := Endpoint{
+		SshUserAndHost: "userandhost",
+		SshPort:        "1",
+		SshPath:        "path",
+	}
+
+	res, err := cache.Resolve(e, "post")
+	assert.Nil(t, err)
+	assert.Equal(t, "cache", res.Href)
+}
+
+func TestSSHCacheResolveFromCacheWithFutureExpiresIn(t *testing.T) {
+	ssh := newFakeResolver()
+	cache := withSSHCache(ssh).(*sshCache)
+	cache.endpoints["userandhost//1//path//post"] = &sshAuthResponse{
+		Href:      "cache",
+		ExpiresIn: 60 * 60,
+		createdAt: time.Now(),
+	}
+	ssh.responses["userandhost"] = sshAuthResponse{Href: "real"}
+
+	e := Endpoint{
+		SshUserAndHost: "userandhost",
+		SshPort:        "1",
+		SshPath:        "path",
+	}
+
+	res, err := cache.Resolve(e, "post")
+	assert.Nil(t, err)
+	assert.Equal(t, "cache", res.Href)
+}
+
+func TestSSHCacheResolveFromCacheWithPastExpiresAt(t *testing.T) {
+	ssh := newFakeResolver()
+	cache := withSSHCache(ssh).(*sshCache)
+	cache.endpoints["userandhost//1//path//post"] = &sshAuthResponse{
+		Href:      "cache",
+		ExpiresAt: time.Now().Add(time.Duration(-1) * time.Hour),
+		createdAt: time.Now(),
+	}
+	ssh.responses["userandhost"] = sshAuthResponse{Href: "real"}
+
+	e := Endpoint{
+		SshUserAndHost: "userandhost",
+		SshPort:        "1",
+		SshPath:        "path",
+	}
+
+	res, err := cache.Resolve(e, "post")
+	assert.Nil(t, err)
+	assert.Equal(t, "real", res.Href)
+}
+
+func TestSSHCacheResolveFromCacheWithPastExpiresIn(t *testing.T) {
+	ssh := newFakeResolver()
+	cache := withSSHCache(ssh).(*sshCache)
+	cache.endpoints["userandhost//1//path//post"] = &sshAuthResponse{
+		Href:      "cache",
+		ExpiresIn: -60 * 60,
+		createdAt: time.Now(),
+	}
+	ssh.responses["userandhost"] = sshAuthResponse{Href: "real"}
+
+	e := Endpoint{
+		SshUserAndHost: "userandhost",
+		SshPort:        "1",
+		SshPath:        "path",
+	}
+
+	res, err := cache.Resolve(e, "post")
+	assert.Nil(t, err)
+	assert.Equal(t, "real", res.Href)
+}
+
+func TestSSHCacheResolveFromCacheWithAmbiguousExpirationInfo(t *testing.T) {
+	ssh := newFakeResolver()
+	cache := withSSHCache(ssh).(*sshCache)
+	cache.endpoints["userandhost//1//path//post"] = &sshAuthResponse{
+		Href:      "cache",
+		ExpiresIn: 60 * 60,
+		ExpiresAt: time.Now().Add(-1 * time.Hour),
+		createdAt: time.Now(),
+	}
+	ssh.responses["userandhost"] = sshAuthResponse{Href: "real"}
+
+	e := Endpoint{
+		SshUserAndHost: "userandhost",
+		SshPort:        "1",
+		SshPath:        "path",
+	}
+
+	res, err := cache.Resolve(e, "post")
+	assert.Nil(t, err)
+	assert.Equal(t, "cache", res.Href)
+}
+
+func TestSSHCacheResolveWithoutError(t *testing.T) {
+	ssh := newFakeResolver()
+	cache := withSSHCache(ssh).(*sshCache)
+
+	assert.Equal(t, 0, len(cache.endpoints))
+
+	ssh.responses["userandhost"] = sshAuthResponse{Href: "real"}
+
+	e := Endpoint{
+		SshUserAndHost: "userandhost",
+		SshPort:        "1",
+		SshPath:        "path",
+	}
+
+	res, err := cache.Resolve(e, "post")
+	assert.Nil(t, err)
+	assert.Equal(t, "real", res.Href)
+
+	assert.Equal(t, 1, len(cache.endpoints))
+	cacheres, ok := cache.endpoints["userandhost//1//path//post"]
+	assert.True(t, ok)
+	assert.NotNil(t, cacheres)
+	assert.Equal(t, "real", cacheres.Href)
+
+	delete(ssh.responses, "userandhost")
+	res2, err := cache.Resolve(e, "post")
+	assert.Nil(t, err)
+	assert.Equal(t, "real", res2.Href)
+}
+
+func TestSSHCacheResolveWithError(t *testing.T) {
+	ssh := newFakeResolver()
+	cache := withSSHCache(ssh).(*sshCache)
+
+	assert.Equal(t, 0, len(cache.endpoints))
+
+	ssh.responses["userandhost"] = sshAuthResponse{Message: "resolve error", Href: "real"}
+
+	e := Endpoint{
+		SshUserAndHost: "userandhost",
+		SshPort:        "1",
+		SshPath:        "path",
+	}
+
+	res, err := cache.Resolve(e, "post")
+	assert.NotNil(t, err)
+	assert.Equal(t, "real", res.Href)
+
+	assert.Equal(t, 0, len(cache.endpoints))
+	delete(ssh.responses, "userandhost")
+	res2, err := cache.Resolve(e, "post")
+	assert.Nil(t, err)
+	assert.Equal(t, "", res2.Href)
+}
+
+func newFakeResolver() *fakeResolver {
+	return &fakeResolver{responses: make(map[string]sshAuthResponse)}
+}
+
+type fakeResolver struct {
+	responses map[string]sshAuthResponse
+}
+
+func (r *fakeResolver) Resolve(e Endpoint, method string) (sshAuthResponse, error) {
+	res := r.responses[e.SshUserAndHost]
+	var err error
+	if len(res.Message) > 0 {
+		err = errors.New(res.Message)
+	}
+
+	res.createdAt = time.Now()
+
+	return res, err
+}
+
 func TestSSHGetLFSExeAndArgs(t *testing.T) {
-	cli, err := NewClient(TestEnv(map[string]string{}), nil)
+	cli, err := NewClient(UniqTestEnv(map[string]string{}), nil)
 	require.Nil(t, err)
 
 	endpoint := cli.Endpoints.Endpoint("download", "")
@@ -48,7 +251,7 @@ func TestSSHGetLFSExeAndArgs(t *testing.T) {
 }
 
 func TestSSHGetExeAndArgsSsh(t *testing.T) {
-	cli, err := NewClient(TestEnv(map[string]string{
+	cli, err := NewClient(UniqTestEnv(map[string]string{
 		"GIT_SSH_COMMAND": "",
 		"GIT_SSH":         "",
 	}), nil)
@@ -63,7 +266,7 @@ func TestSSHGetExeAndArgsSsh(t *testing.T) {
 }
 
 func TestSSHGetExeAndArgsSshCustomPort(t *testing.T) {
-	cli, err := NewClient(TestEnv(map[string]string{
+	cli, err := NewClient(UniqTestEnv(map[string]string{
 		"GIT_SSH_COMMAND": "",
 		"GIT_SSH":         "",
 	}), nil)
@@ -81,7 +284,7 @@ func TestSSHGetExeAndArgsSshCustomPort(t *testing.T) {
 func TestSSHGetExeAndArgsPlink(t *testing.T) {
 	plink := filepath.Join("Users", "joebloggs", "bin", "plink.exe")
 
-	cli, err := NewClient(TestEnv(map[string]string{
+	cli, err := NewClient(UniqTestEnv(map[string]string{
 		"GIT_SSH_COMMAND": "",
 		"GIT_SSH":         plink,
 	}), nil)
@@ -98,7 +301,7 @@ func TestSSHGetExeAndArgsPlink(t *testing.T) {
 func TestSSHGetExeAndArgsPlinkCustomPort(t *testing.T) {
 	plink := filepath.Join("Users", "joebloggs", "bin", "plink")
 
-	cli, err := NewClient(TestEnv(map[string]string{
+	cli, err := NewClient(UniqTestEnv(map[string]string{
 		"GIT_SSH_COMMAND": "",
 		"GIT_SSH":         plink,
 	}), nil)
@@ -116,7 +319,7 @@ func TestSSHGetExeAndArgsPlinkCustomPort(t *testing.T) {
 func TestSSHGetExeAndArgsTortoisePlink(t *testing.T) {
 	plink := filepath.Join("Users", "joebloggs", "bin", "tortoiseplink.exe")
 
-	cli, err := NewClient(TestEnv(map[string]string{
+	cli, err := NewClient(UniqTestEnv(map[string]string{
 		"GIT_SSH_COMMAND": "",
 		"GIT_SSH":         plink,
 	}), nil)
@@ -133,7 +336,7 @@ func TestSSHGetExeAndArgsTortoisePlink(t *testing.T) {
 func TestSSHGetExeAndArgsTortoisePlinkCustomPort(t *testing.T) {
 	plink := filepath.Join("Users", "joebloggs", "bin", "tortoiseplink")
 
-	cli, err := NewClient(TestEnv(map[string]string{
+	cli, err := NewClient(UniqTestEnv(map[string]string{
 		"GIT_SSH_COMMAND": "",
 		"GIT_SSH":         plink,
 	}), nil)
@@ -149,7 +352,7 @@ func TestSSHGetExeAndArgsTortoisePlinkCustomPort(t *testing.T) {
 }
 
 func TestSSHGetExeAndArgsSshCommandPrecedence(t *testing.T) {
-	cli, err := NewClient(TestEnv(map[string]string{
+	cli, err := NewClient(UniqTestEnv(map[string]string{
 		"GIT_SSH_COMMAND": "sshcmd",
 		"GIT_SSH":         "bad",
 	}), nil)
@@ -164,7 +367,7 @@ func TestSSHGetExeAndArgsSshCommandPrecedence(t *testing.T) {
 }
 
 func TestSSHGetExeAndArgsSshCommandArgs(t *testing.T) {
-	cli, err := NewClient(TestEnv(map[string]string{
+	cli, err := NewClient(UniqTestEnv(map[string]string{
 		"GIT_SSH_COMMAND": "sshcmd --args 1",
 	}), nil)
 	require.Nil(t, err)
@@ -177,8 +380,22 @@ func TestSSHGetExeAndArgsSshCommandArgs(t *testing.T) {
 	assert.Equal(t, []string{"--args", "1", "user@foo.com"}, args)
 }
 
+func TestSSHGetExeAndArgsSshCommandArgsWithMixedQuotes(t *testing.T) {
+	cli, err := NewClient(UniqTestEnv(map[string]string{
+		"GIT_SSH_COMMAND": "sshcmd foo 'bar \"baz\"'",
+	}), nil)
+	require.Nil(t, err)
+
+	endpoint := cli.Endpoints.Endpoint("download", "")
+	endpoint.SshUserAndHost = "user@foo.com"
+
+	exe, args := sshGetExeAndArgs(cli.OSEnv(), endpoint)
+	assert.Equal(t, "sshcmd", exe)
+	assert.Equal(t, []string{"foo", `bar "baz"`, "user@foo.com"}, args)
+}
+
 func TestSSHGetExeAndArgsSshCommandCustomPort(t *testing.T) {
-	cli, err := NewClient(TestEnv(map[string]string{
+	cli, err := NewClient(UniqTestEnv(map[string]string{
 		"GIT_SSH_COMMAND": "sshcmd",
 	}), nil)
 	require.Nil(t, err)
@@ -195,7 +412,7 @@ func TestSSHGetExeAndArgsSshCommandCustomPort(t *testing.T) {
 func TestSSHGetExeAndArgsPlinkCommand(t *testing.T) {
 	plink := filepath.Join("Users", "joebloggs", "bin", "plink.exe")
 
-	cli, err := NewClient(TestEnv(map[string]string{
+	cli, err := NewClient(UniqTestEnv(map[string]string{
 		"GIT_SSH_COMMAND": plink,
 	}), nil)
 	require.Nil(t, err)
@@ -211,7 +428,7 @@ func TestSSHGetExeAndArgsPlinkCommand(t *testing.T) {
 func TestSSHGetExeAndArgsPlinkCommandCustomPort(t *testing.T) {
 	plink := filepath.Join("Users", "joebloggs", "bin", "plink")
 
-	cli, err := NewClient(TestEnv(map[string]string{
+	cli, err := NewClient(UniqTestEnv(map[string]string{
 		"GIT_SSH_COMMAND": plink,
 	}), nil)
 	require.Nil(t, err)
@@ -228,7 +445,7 @@ func TestSSHGetExeAndArgsPlinkCommandCustomPort(t *testing.T) {
 func TestSSHGetExeAndArgsTortoisePlinkCommand(t *testing.T) {
 	plink := filepath.Join("Users", "joebloggs", "bin", "tortoiseplink.exe")
 
-	cli, err := NewClient(TestEnv(map[string]string{
+	cli, err := NewClient(UniqTestEnv(map[string]string{
 		"GIT_SSH_COMMAND": plink,
 	}), nil)
 	require.Nil(t, err)
@@ -244,7 +461,7 @@ func TestSSHGetExeAndArgsTortoisePlinkCommand(t *testing.T) {
 func TestSSHGetExeAndArgsTortoisePlinkCommandCustomPort(t *testing.T) {
 	plink := filepath.Join("Users", "joebloggs", "bin", "tortoiseplink")
 
-	cli, err := NewClient(TestEnv(map[string]string{
+	cli, err := NewClient(UniqTestEnv(map[string]string{
 		"GIT_SSH_COMMAND": plink,
 	}), nil)
 	require.Nil(t, err)

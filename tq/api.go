@@ -1,6 +1,8 @@
 package tq
 
 import (
+	"time"
+
 	"github.com/git-lfs/git-lfs/errors"
 	"github.com/git-lfs/git-lfs/lfsapi"
 	"github.com/rubyist/tracerx"
@@ -45,6 +47,8 @@ func (c *tqClient) Batch(remote string, bReq *batchRequest) (*BatchResponse, err
 	}
 
 	bRes.endpoint = c.Endpoints.Endpoint(bReq.Operation, remote)
+	requestedAt := time.Now()
+
 	req, err := c.NewRequest("POST", bRes.endpoint, "objects/batch", bReq)
 	if err != nil {
 		return nil, errors.Wrap(err, "batch request")
@@ -52,12 +56,12 @@ func (c *tqClient) Batch(remote string, bReq *batchRequest) (*BatchResponse, err
 
 	tracerx.Printf("api: batch %d files", len(bReq.Objects))
 
+	req = c.LogRequest(req, "lfs.batch")
 	res, err := c.DoWithAuth(remote, req)
 	if err != nil {
 		tracerx.Printf("api error: %s", err)
 		return nil, errors.Wrap(err, "batch response")
 	}
-	c.LogResponse("lfs.batch", res)
 
 	if err := lfsapi.DecodeJSON(res, bRes); err != nil {
 		return bRes, errors.Wrap(err, "batch response")
@@ -65,6 +69,12 @@ func (c *tqClient) Batch(remote string, bReq *batchRequest) (*BatchResponse, err
 
 	if res.StatusCode != 200 {
 		return nil, lfsapi.NewStatusCodeError(res)
+	}
+
+	for _, obj := range bRes.Objects {
+		for _, a := range obj.Actions {
+			a.createdAt = requestedAt
+		}
 	}
 
 	return bRes, nil

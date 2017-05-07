@@ -1,16 +1,37 @@
 package commands
 
 import (
+	"fmt"
+	"net/url"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 
+	"github.com/git-lfs/git-lfs/config"
 	"github.com/git-lfs/git-lfs/errors"
+	"github.com/git-lfs/git-lfs/git"
 	"github.com/git-lfs/git-lfs/lfs"
+	"github.com/git-lfs/git-lfs/lfsapi"
 	"github.com/git-lfs/git-lfs/locking"
 	"github.com/git-lfs/git-lfs/progress"
 	"github.com/git-lfs/git-lfs/tools"
 	"github.com/git-lfs/git-lfs/tq"
+	"github.com/rubyist/tracerx"
 )
+
+func uploadLeftOrAll(g *lfs.GitScanner, ctx *uploadContext, ref string) error {
+	if pushAll {
+		if err := g.ScanRefWithDeleted(ref, nil); err != nil {
+			return err
+		}
+	} else {
+		if err := g.ScanLeftToRemote(ref, nil); err != nil {
+			return err
+		}
+	}
+	return ctx.scannerError()
+}
 
 type uploadContext struct {
 	Remote       string
@@ -27,15 +48,46 @@ type uploadContext struct {
 	trackedLocksMu *sync.Mutex
 
 	// ALL verifiable locks
-	ourLocks   map[string]*locking.Lock
-	theirLocks map[string]*locking.Lock
+	lockVerifyState verifyState
+	ourLocks        map[string]locking.Lock
+	theirLocks      map[string]locking.Lock
 
 	// locks from ourLocks that were modified in this push
-	ownedLocks []*locking.Lock
+	ownedLocks []locking.Lock
 
 	// locks from theirLocks that were modified in this push
-	unownedLocks []*locking.Lock
+	unownedLocks []locking.Lock
+
+	// allowMissing specifies whether pushes containing missing/corrupt
+	// pointers should allow pushing Git blobs
+	allowMissing bool
+
+	// tracks errors from gitscanner callbacks
+	scannerErr error
+	errMu      sync.Mutex
 }
+
+// Determines if a filename is lockable. Serves as a wrapper around theirLocks
+// that implements GitScannerSet.
+type gitScannerLockables struct {
+	m map[string]locking.Lock
+}
+
+func (l *gitScannerLockables) Contains(name string) bool {
+	if l == nil {
+		return false
+	}
+	_, ok := l.m[name]
+	return ok
+}
+
+type verifyState byte
+
+const (
+	verifyStateUnknown verifyState = iota
+	verifyStateEnabled
+	verifyStateDisabled
+)
 
 func newUploadContext(remote string, dryRun bool) *uploadContext {
 	cfg.CurrentRemote = remote
@@ -45,30 +97,98 @@ func newUploadContext(remote string, dryRun bool) *uploadContext {
 		Manifest:       getTransferManifest(),
 		DryRun:         dryRun,
 		uploadedOids:   tools.NewStringSet(),
-		ourLocks:       make(map[string]*locking.Lock),
-		theirLocks:     make(map[string]*locking.Lock),
+		ourLocks:       make(map[string]locking.Lock),
+		theirLocks:     make(map[string]locking.Lock),
 		trackedLocksMu: new(sync.Mutex),
+		allowMissing:   cfg.Git.Bool("lfs.allowincompletepush", false),
 	}
 
 	ctx.meter = buildProgressMeter(ctx.DryRun)
 	ctx.tq = newUploadQueue(ctx.Manifest, ctx.Remote, tq.WithProgress(ctx.meter), tq.DryRun(ctx.DryRun))
 	ctx.committerName, ctx.committerEmail = cfg.CurrentCommitter()
 
-	lockClient := newLockClient(remote)
-	ourLocks, theirLocks, err := lockClient.VerifiableLocks(0)
-	if err != nil {
-		Error("WARNING: Unable to search for locks contained in this push.")
-		Error("         Temporarily skipping check ...")
-	} else {
-		for _, l := range theirLocks {
-			ctx.theirLocks[l.Path] = &l
-		}
-		for _, l := range ourLocks {
-			ctx.ourLocks[l.Path] = &l
-		}
+	ourLocks, theirLocks, verifyState := verifyLocks(remote)
+	ctx.lockVerifyState = verifyState
+	for _, l := range theirLocks {
+		ctx.theirLocks[l.Path] = l
+	}
+	for _, l := range ourLocks {
+		ctx.ourLocks[l.Path] = l
 	}
 
 	return ctx
+}
+
+func verifyLocks(remote string) (ours, theirs []locking.Lock, st verifyState) {
+	endpoint := getAPIClient().Endpoints.Endpoint("upload", remote)
+	state := getVerifyStateFor(endpoint)
+
+	lockClient := newLockClient(remote)
+
+	ours, theirs, err := lockClient.VerifiableLocks(0)
+	if err != nil {
+		if errors.IsNotImplementedError(err) {
+			disableFor(endpoint)
+		} else if state == verifyStateUnknown || state == verifyStateEnabled {
+			if errors.IsAuthError(err) {
+				if state == verifyStateUnknown {
+					Error("WARNING: Authentication error: %s", err)
+				} else if state == verifyStateEnabled {
+					Exit("ERROR: Authentication error: %s", err)
+				}
+			} else {
+				Print("Remote %q does not support the LFS locking API. Consider disabling it with:", remote)
+				Print("  $ git config 'lfs.%s.locksverify' false", endpoint.Url)
+				if state == verifyStateEnabled {
+					ExitWithError(err)
+				}
+			}
+		}
+	} else if state == verifyStateUnknown {
+		Print("Locking support detected on remote %q. Consider enabling it with:", remote)
+		Print("  $ git config 'lfs.%s.locksverify' true", endpoint.Url)
+	}
+
+	return ours, theirs, state
+}
+
+func (c *uploadContext) scannerError() error {
+	c.errMu.Lock()
+	defer c.errMu.Unlock()
+
+	return c.scannerErr
+}
+
+func (c *uploadContext) addScannerError(err error) {
+	c.errMu.Lock()
+	defer c.errMu.Unlock()
+
+	if c.scannerErr != nil {
+		c.scannerErr = fmt.Errorf("%v\n%v", c.scannerErr, err)
+	} else {
+		c.scannerErr = err
+	}
+}
+
+func (c *uploadContext) buildGitScanner() (*lfs.GitScanner, error) {
+	gitscanner := lfs.NewGitScanner(func(p *lfs.WrappedPointer, err error) {
+		if err != nil {
+			c.addScannerError(err)
+		} else {
+			uploadPointers(c, p)
+		}
+	})
+
+	gitscanner.FoundLockable = func(name string) {
+		if lock, ok := c.theirLocks[name]; ok {
+			c.trackedLocksMu.Lock()
+			c.unownedLocks = append(c.unownedLocks, lock)
+			c.trackedLocksMu.Unlock()
+		}
+	}
+
+	gitscanner.PotentialLockables = &gitScannerLockables{m: c.theirLocks}
+	return gitscanner, gitscanner.RemoteForPush(c.Remote)
 }
 
 // AddUpload adds the given oid to the set of oids that have been uploaded in
@@ -111,7 +231,16 @@ func (c *uploadContext) prepareUpload(unfiltered ...*lfs.WrappedPointer) (*tq.Tr
 			c.trackedLocksMu.Lock()
 			c.unownedLocks = append(c.unownedLocks, lock)
 			c.trackedLocksMu.Unlock()
-			canUpload = false
+
+			// If the verification state is enabled, this failed
+			// locks verification means that the push should fail.
+			//
+			// If the state is disabled, the verification error is
+			// silent and the user can upload.
+			//
+			// If the state is undefined, the verification error is
+			// sent as a warning and the user can upload.
+			canUpload = c.lockVerifyState != verifyStateEnabled
 		}
 
 		if lock, ok := c.ourLocks[p.Name]; ok {
@@ -162,23 +291,62 @@ func uploadPointers(c *uploadContext, unfiltered ...*lfs.WrappedPointer) {
 func (c *uploadContext) Await() {
 	c.tq.Wait()
 
+	var missing = make(map[string]string)
+	var corrupt = make(map[string]string)
+	var others = make([]error, 0, len(c.tq.Errors()))
+
 	for _, err := range c.tq.Errors() {
+		if malformed, ok := err.(*tq.MalformedObjectError); ok {
+			if malformed.Missing() {
+				missing[malformed.Name] = malformed.Oid
+			} else if malformed.Corrupt() {
+				corrupt[malformed.Name] = malformed.Oid
+			}
+		} else {
+			others = append(others, err)
+		}
+	}
+
+	for _, err := range others {
 		FullError(err)
 	}
 
-	if len(c.tq.Errors()) > 0 {
+	if len(missing) > 0 || len(corrupt) > 0 {
+		var action string
+		if c.allowMissing {
+			action = "missing objects"
+		} else {
+			action = "failed"
+		}
+
+		Print("LFS upload %s:", action)
+		for name, oid := range missing {
+			Print("  (missing) %s (%s)", name, oid)
+		}
+		for name, oid := range corrupt {
+			Print("  (corrupt) %s (%s)", name, oid)
+		}
+
+		if !c.allowMissing {
+			os.Exit(2)
+		}
+	}
+
+	if len(others) > 0 {
 		os.Exit(2)
 	}
 
-	var avoidPush bool
-
 	c.trackedLocksMu.Lock()
 	if ul := len(c.unownedLocks); ul > 0 {
-		avoidPush = true
-
 		Print("Unable to push %d locked file(s):", ul)
 		for _, unowned := range c.unownedLocks {
-			Print("* %s - %s", unowned.Path, unowned.Committer)
+			Print("* %s - %s", unowned.Path, unowned.Owner)
+		}
+
+		if c.lockVerifyState == verifyStateEnabled {
+			Exit("ERROR: Cannot update locked files.")
+		} else {
+			Error("WARNING: The above files would have halted this push.")
 		}
 	} else if len(c.ownedLocks) > 0 {
 		Print("Consider unlocking your own locked file(s): (`git lfs unlock <path>`)")
@@ -187,8 +355,69 @@ func (c *uploadContext) Await() {
 		}
 	}
 	c.trackedLocksMu.Unlock()
+}
 
-	if avoidPush {
-		Error("WARNING: The above files would have halted this push.")
+var (
+	githubHttps, _ = url.Parse("https://github.com")
+	githubSsh, _   = url.Parse("ssh://github.com")
+
+	// hostsWithKnownLockingSupport is a list of scheme-less hostnames
+	// (without port numbers) that are known to implement the LFS locking
+	// API.
+	//
+	// Additions are welcome.
+	hostsWithKnownLockingSupport = []*url.URL{
+		githubHttps, githubSsh,
 	}
+)
+
+// getVerifyStateFor returns whether or not lock verification is enabled for the
+// given "endpoint". If no state has been explicitly set, an "unknown" state
+// will be returned instead.
+func getVerifyStateFor(endpoint lfsapi.Endpoint) verifyState {
+	uc := config.NewURLConfig(cfg.Git)
+
+	v, ok := uc.Get("lfs", endpoint.Url, "locksverify")
+	if !ok {
+		if supportsLockingAPI(endpoint) {
+			return verifyStateEnabled
+		}
+		return verifyStateUnknown
+	}
+
+	if enabled, _ := strconv.ParseBool(v); enabled {
+		return verifyStateEnabled
+	}
+	return verifyStateDisabled
+}
+
+// supportsLockingAPI returns whether or not a given lfsapi.Endpoint "e"
+// is known to support the LFS locking API by whether or not its hostname is
+// included in the list above.
+func supportsLockingAPI(e lfsapi.Endpoint) bool {
+	u, err := url.Parse(e.Url)
+	if err != nil {
+		tracerx.Printf("commands: unable to parse %q to determine locking support: %v", e.Url, err)
+		return false
+	}
+
+	for _, supported := range hostsWithKnownLockingSupport {
+		if supported.Scheme == u.Scheme &&
+			supported.Hostname() == u.Hostname() &&
+			strings.HasPrefix(u.Path, supported.Path) {
+			return true
+		}
+	}
+	return false
+}
+
+// disableFor disables lock verification for the given lfsapi.Endpoint,
+// "endpoint".
+func disableFor(endpoint lfsapi.Endpoint) error {
+	tracerx.Printf("commands: disabling lock verification for %q", endpoint.Url)
+
+	key := strings.Join([]string{"lfs", endpoint.Url, "locksverify"}, ".")
+
+	_, err := git.Config.SetLocal("", key, "false")
+	return err
 }

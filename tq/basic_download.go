@@ -88,10 +88,12 @@ func (a *basicDownloadAdapter) download(t *Transfer, cb ProgressCallback, authOk
 		defer dlFile.Close()
 	}
 
-	rel, err := t.Actions.Get("download")
+	rel, err := t.Rel("download")
 	if err != nil {
 		return err
-		// return errors.New("Object not found on the server.")
+	}
+	if rel == nil {
+		return errors.Errorf("Object %s not found on the server.", t.Oid)
 	}
 
 	req, err := a.newHTTPRequest("GET", rel)
@@ -107,6 +109,7 @@ func (a *basicDownloadAdapter) download(t *Transfer, cb ProgressCallback, authOk
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", fromByte, t.Size-1))
 	}
 
+	req = a.apiClient.LogRequest(req, "lfs.data.download")
 	res, err := a.doHTTP(t, req)
 	if err != nil {
 		// Special-case status code 416 () - fall back
@@ -119,7 +122,6 @@ func (a *basicDownloadAdapter) download(t *Transfer, cb ProgressCallback, authOk
 		return errors.NewRetriableError(err)
 	}
 
-	a.apiClient.LogResponse("lfs.data.download", res)
 	defer res.Body.Close()
 
 	// Range request must return 206 & content range to confirm

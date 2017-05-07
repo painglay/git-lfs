@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"runtime"
 	"strings"
-
-	"github.com/git-lfs/git-lfs/lfsapi"
 )
 
 var (
@@ -14,7 +12,7 @@ var (
 )
 
 const (
-	Version = "1.5.0"
+	Version = "2.2.0-pre"
 )
 
 func init() {
@@ -29,6 +27,4 @@ func init() {
 		strings.Replace(runtime.Version(), "go", "", 1),
 		gitCommit,
 	)
-
-	lfsapi.UserAgent = VersionDesc
 }

@@ -52,7 +52,7 @@ func pull(remote string, filter *filepathfilter.Filter) {
 	q := newDownloadQueue(singleCheckout.manifest, remote, tq.WithProgress(meter))
 	gitscanner := lfs.NewGitScanner(func(p *lfs.WrappedPointer, err error) {
 		if err != nil {
-			LoggedError(err, "Scanner error")
+			LoggedError(err, "Scanner error: %s", err)
 			return
 		}
 
@@ -91,6 +91,8 @@ func pull(remote string, filter *filepathfilter.Filter) {
 
 	processQueue := time.Now()
 	if err := gitscanner.ScanTree(ref.Sha); err != nil {
+		singleCheckout.Close()
+
 		ExitWithError(err)
 	}
 
